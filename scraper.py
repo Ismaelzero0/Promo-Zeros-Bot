@@ -71,6 +71,10 @@ CUPONS = [
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
+# trava de segurança: no máximo X mensagens novas por categoria por execução.
+# evita flood se a página mudar de estrutura e "revelar" muitas ofertas de vez.
+MAX_NOVAS_POR_CATEGORIA = 8
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -93,14 +97,17 @@ def slugify(nome: str) -> str:
     return s.strip("-")
 
 
-def carregar_vistos(categoria_slug: str) -> set:
+def carregar_vistos(categoria_slug: str) -> tuple[set, bool]:
+    """Devolve (ids_vistos, eh_primeira_vez). eh_primeira_vez=True quando
+    ainda não existe histórico pra essa categoria — usado pra não postar
+    tudo que já tava na página de uma vez só (flood no primeiro run)."""
     arquivo = DATA_DIR / f"{categoria_slug}.json"
     if arquivo.exists():
         try:
-            return set(json.loads(arquivo.read_text(encoding="utf-8")))
+            return set(json.loads(arquivo.read_text(encoding="utf-8"))), False
         except Exception:
-            return set()
-    return set()
+            return set(), False
+    return set(), True
 
 
 def salvar_vistos(categoria_slug: str, vistos: set):
@@ -286,15 +293,33 @@ def main():
             print(f"  falha ao acessar {url}: {e}")
             continue
 
-        vistos = carregar_vistos(slug)
+        vistos, primeira_vez = carregar_vistos(slug)
         precos_historico = carregar_precos(slug)
         novas = [o for o in ofertas if o["id"] not in vistos]
+
+        if primeira_vez:
+            # primeira vez que essa categoria é checada: não posta o que já
+            # tava na página, só marca tudo como visto e passa a monitorar
+            # daqui pra frente.
+            print(f"  primeira checagem desta categoria — salvando {len(ofertas)} oferta(s) sem postar")
+            for o in ofertas:
+                vistos.add(o["id"])
+            salvar_vistos(slug, vistos)
+            continue
 
         if not novas:
             print(f"  nenhuma oferta nova ({len(ofertas)} encontradas no total)")
             continue
 
-        print(f"  {len(novas)} oferta(s) nova(s) encontrada(s)")
+        if len(novas) > MAX_NOVAS_POR_CATEGORIA:
+            print(f"  {len(novas)} novas de uma vez (> limite de {MAX_NOVAS_POR_CATEGORIA}) — "
+                  f"postando só as {MAX_NOVAS_POR_CATEGORIA} mais recentes pra não floodar")
+            # marca as excedentes como vistas sem postar (evita reavaliar toda hora)
+            for o in novas[MAX_NOVAS_POR_CATEGORIA:]:
+                vistos.add(o["id"])
+            novas = novas[:MAX_NOVAS_POR_CATEGORIA]
+        else:
+            print(f"  {len(novas)} oferta(s) nova(s) encontrada(s)")
 
         for oferta in reversed(novas):
             avaliacao = groq_helper.avaliar_oferta(
@@ -333,14 +358,28 @@ def main():
             print(f"  falha ao acessar {url}: {e}")
             continue
 
-        vistos = carregar_vistos(slug)
+        vistos, primeira_vez = carregar_vistos(slug)
         novos = [c for c in cupons if c["id"] not in vistos]
+
+        if primeira_vez:
+            print(f"  primeira checagem desta loja — salvando {len(cupons)} cupom(ns) sem postar")
+            for c in cupons:
+                vistos.add(c["id"])
+            salvar_vistos(slug, vistos)
+            continue
 
         if not novos:
             print(f"  nenhum cupom novo ({len(cupons)} encontrados no total)")
             continue
 
-        print(f"  {len(novos)} cupom(ns) novo(s) encontrado(s)")
+        if len(novos) > MAX_NOVAS_POR_CATEGORIA:
+            print(f"  {len(novos)} novos de uma vez (> limite de {MAX_NOVAS_POR_CATEGORIA}) — "
+                  f"postando só os {MAX_NOVAS_POR_CATEGORIA} mais recentes pra não floodar")
+            for c in novos[MAX_NOVAS_POR_CATEGORIA:]:
+                vistos.add(c["id"])
+            novos = novos[:MAX_NOVAS_POR_CATEGORIA]
+        else:
+            print(f"  {len(novos)} cupom(ns) novo(s) encontrado(s)")
 
         for cupom in reversed(novos):
             msg = formatar_mensagem_cupom(nome_categoria, cupom)

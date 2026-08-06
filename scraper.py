@@ -19,6 +19,8 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
+import groq_helper
+
 # ----------------------------------------------------------------------
 # Configuração
 # ----------------------------------------------------------------------
@@ -51,6 +53,11 @@ CATEGORIAS = [
     ("Projetores", "https://www.promobit.com.br/promocoes/projetores/s/"),
     ("Fone de Ouvido", "https://www.promobit.com.br/promocoes/fone-de-ouvido/s/"),
     ("TV", "https://www.promobit.com.br/promocoes/tv/s/"),
+    ("Whey Protein", "https://www.promobit.com.br/promocoes/whey-protein/s/"),
+]
+
+# Cupons são tratados separado (estrutura de página diferente das ofertas)
+CUPONS = [
     ("Cupom Mercado Livre", "https://www.promobit.com.br/cupons/loja/mercado-livre/"),
     ("Cupom Amazon", "https://www.promobit.com.br/cupons/loja/amazon/"),
     ("Cupom Shopee", "https://www.promobit.com.br/cupons/loja/shopee/"),
@@ -59,7 +66,6 @@ CATEGORIAS = [
     ("Cupom KaBuM!", "https://www.promobit.com.br/cupons/loja/kabum/"),
     ("Cupom Nike", "https://www.promobit.com.br/cupons/loja/nike/"),
     ("Cupom Loja LG", "https://www.promobit.com.br/cupons/loja/loja-lg/"),
-    ("Whey Protein", "https://www.promobit.com.br/promocoes/whey-protein/s/"),
 ]
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -155,6 +161,57 @@ def buscar_ofertas(url: str):
     return ofertas
 
 
+CUPOM_HREF_RE = re.compile(r"/cupons?/loja/[\w-]+/?$")
+
+
+def buscar_cupons(url: str):
+    """
+    Extrai cupons de uma página de loja do Promobit.
+    IMPORTANTE: o código do cupom em si só aparece depois de clicar em
+    "Pegar cupom" no site (carregado via JS), então não conseguimos pegar
+    o código automaticamente. O que dá pra fazer é avisar que saiu um
+    cupom novo, com o desconto e o link direto pra página.
+    """
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    cupons = []
+
+    # cada cupom fica dentro de um bloco com um <h2>/<h3> de título e
+    # um badge de desconto antes dele (ex: "25%", "R$ 60", "Frete grátis")
+    for titulo_tag in soup.find_all(["h2", "h3"]):
+        texto_titulo = titulo_tag.get_text(strip=True)
+        if not texto_titulo or len(texto_titulo) < 8:
+            continue
+
+        # ignora títulos que claramente não são de cupom (ex: títulos de seção)
+        if texto_titulo.lower().startswith(("perguntas frequentes", "resumo de", "informações sobre",
+                                              "opiniões sobre", "melhores cupons", "cupom ")):
+            continue
+
+        # tenta achar o desconto (badge) que vem antes do título no HTML
+        desconto = None
+        anterior = titulo_tag.find_previous(string=re.compile(r"^\s*(\d+%|R\$\s?[\d.,]+|Frete Grátis)\s*$"))
+        if anterior:
+            desconto = anterior.strip()
+
+        # gera um id estável baseado no texto do título (não muda entre execuções)
+        import hashlib
+        cupom_id = hashlib.md5(texto_titulo.encode("utf-8")).hexdigest()[:12]
+
+        cupons.append(
+            {
+                "id": cupom_id,
+                "titulo": texto_titulo,
+                "desconto": desconto,
+                "link": url,
+            }
+        )
+
+    return cupons
+
+
 def enviar_telegram(mensagem: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -169,12 +226,24 @@ def enviar_telegram(mensagem: str):
     return resp.ok
 
 
-def formatar_mensagem(categoria: str, oferta: dict) -> str:
+def formatar_mensagem(categoria: str, oferta: dict, comentario_ia: str = None) -> str:
     partes = [f"🔥 <b>{oferta['titulo']}</b>"]
     if oferta["preco"]:
         partes.append(f"💰 {oferta['preco']}")
+    if comentario_ia:
+        partes.append(f"🤖 {comentario_ia}")
     partes.append(f"📂 {categoria}")
     partes.append(oferta["link"])
+    return "\n".join(partes)
+
+
+def formatar_mensagem_cupom(categoria: str, cupom: dict) -> str:
+    partes = [f"🎟️ <b>{cupom['titulo']}</b>"]
+    if cupom["desconto"]:
+        partes.append(f"💸 {cupom['desconto']}")
+    partes.append(f"📂 {categoria}")
+    partes.append("👉 clique no link e depois em \"Pegar cupom\" pra ver o código")
+    partes.append(cupom["link"])
     return "\n".join(partes)
 
 
@@ -182,9 +251,31 @@ def formatar_mensagem(categoria: str, oferta: dict) -> str:
 # Execução principal
 # ----------------------------------------------------------------------
 
+def carregar_precos(categoria_slug: str) -> list:
+    """Histórico simples de preços vistos na categoria (só os textos, mais recentes primeiro)."""
+    arquivo = DATA_DIR / f"{categoria_slug}_precos.json"
+    if arquivo.exists():
+        try:
+            return json.loads(arquivo.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def salvar_precos(categoria_slug: str, precos: list):
+    arquivo = DATA_DIR / f"{categoria_slug}_precos.json"
+    arquivo.write_text(json.dumps(precos[:50], ensure_ascii=False), encoding="utf-8")
+
+
 def main():
     total_novas = 0
 
+    if groq_helper.ATIVO:
+        print("IA (Groq) ativada — vai limpar título, comentar preço e filtrar ofertas fracas.\n")
+    else:
+        print("IA (Groq) desativada (sem GROQ_API_KEY) — postando sem filtro/comentário.\n")
+
+    # ---------------- Ofertas normais ----------------
     for nome_categoria, url in CATEGORIAS:
         slug = slugify(nome_categoria)
         print(f"Checando: {nome_categoria} ({url})")
@@ -196,6 +287,7 @@ def main():
             continue
 
         vistos = carregar_vistos(slug)
+        precos_historico = carregar_precos(slug)
         novas = [o for o in ofertas if o["id"] not in vistos]
 
         if not novas:
@@ -204,18 +296,63 @@ def main():
 
         print(f"  {len(novas)} oferta(s) nova(s) encontrada(s)")
 
-        # posta as novas (mais antiga primeiro, pra manter ordem cronológica)
         for oferta in reversed(novas):
-            msg = formatar_mensagem(nome_categoria, oferta)
+            avaliacao = groq_helper.avaliar_oferta(
+                titulo=oferta["titulo"],
+                preco=oferta["preco"],
+                categoria=nome_categoria,
+                historico_precos=precos_historico,
+            )
+
+            vistos.add(oferta["id"])  # marca como visto mesmo se não postar (evita reavaliar toda hora)
+
+            if not avaliacao["postar"]:
+                print(f"  [ignorada pela IA] {oferta['titulo']}")
+                continue
+
+            oferta["titulo"] = avaliacao["titulo"]
+            msg = formatar_mensagem(nome_categoria, oferta, comentario_ia=avaliacao["comentario"])
             ok = enviar_telegram(msg)
             if ok:
                 total_novas += 1
-            vistos.add(oferta["id"])
+            if oferta["preco"]:
+                precos_historico.insert(0, oferta["preco"])
             time.sleep(1.5)  # evita rate limit do Telegram
 
         salvar_vistos(slug, vistos)
+        salvar_precos(slug, precos_historico)
 
-    print(f"\nFinalizado. {total_novas} oferta(s) enviada(s) no total.")
+    # ---------------- Cupons ----------------
+    for nome_categoria, url in CUPONS:
+        slug = slugify(nome_categoria)
+        print(f"Checando: {nome_categoria} ({url})")
+
+        try:
+            cupons = buscar_cupons(url)
+        except Exception as e:
+            print(f"  falha ao acessar {url}: {e}")
+            continue
+
+        vistos = carregar_vistos(slug)
+        novos = [c for c in cupons if c["id"] not in vistos]
+
+        if not novos:
+            print(f"  nenhum cupom novo ({len(cupons)} encontrados no total)")
+            continue
+
+        print(f"  {len(novos)} cupom(ns) novo(s) encontrado(s)")
+
+        for cupom in reversed(novos):
+            msg = formatar_mensagem_cupom(nome_categoria, cupom)
+            ok = enviar_telegram(msg)
+            if ok:
+                total_novas += 1
+            vistos.add(cupom["id"])
+            time.sleep(1.5)
+
+        salvar_vistos(slug, vistos)
+
+    print(f"\nFinalizado. {total_novas} oferta(s)/cupom(ns) enviada(s) no total.")
 
 
 if __name__ == "__main__":

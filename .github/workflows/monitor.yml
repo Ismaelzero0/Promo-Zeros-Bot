@@ -1,5 +1,8 @@
 name: Monitor Promobit
 
+permissions:
+  contents: write   # necessário pra o próprio workflow commitar data/ de volta
+
 on:
   schedule:
     # roda a cada 5 minutos
